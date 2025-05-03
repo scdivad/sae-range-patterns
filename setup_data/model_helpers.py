@@ -5,7 +5,6 @@ Loading, running, and evaluating models/SAEs, including API explanations
 import torch
 from sae_lens import SAE, HookedSAETransformer
 import requests
-from igmask import IGMask
 from typing import Tuple
 from tqdm import tqdm
 

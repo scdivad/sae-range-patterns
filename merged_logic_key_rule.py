@@ -14,14 +14,14 @@ import itertools
 from torch.serialization import add_safe_globals
 from typing import NamedTuple, Iterable, Mapping, Sequence, Union
 
-from sparse_matrix import SparseMatrix
-from data_model_setup.model_helpers import (
+from setup_data.sparse_matrix import SparseMatrix
+from setup_data.model_helpers import (
     load_model_and_saes, 
     model_run_activations, 
     evaluate_on_task, 
     get_latent_explanation,
 )
-from data_model_setup.process_data import load_data, process_data, tokenize_and_reshape, filter_prompts_by_label
+from setup_data.data_helpers import load_data, process_data, tokenize_and_reshape, filter_prompts_by_label
 
 
 class LatentRangeEntry(NamedTuple):
