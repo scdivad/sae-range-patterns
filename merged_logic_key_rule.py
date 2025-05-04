@@ -2,7 +2,6 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import sys
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
