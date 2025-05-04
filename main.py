@@ -386,10 +386,10 @@ def get_prediction(
     predictions = []
     for cls, patterns in rules_by_class.items():
         entries = important_latent_idx_ranges[layer][cls]
-        active_set = torch.tensor(
-            [lb < activation[idx].item() < ub for (idx, lb, ub) in entries],
-            dtype=torch.bool,
-        )
+        active_set = torch.tensor([
+            bool(lb < activation[idx].item() < ub)
+            for (idx, lb, ub) in entries
+        ], dtype=torch.bool)
         for rule_mask in patterns:
             # which is better: if torch.all(rule_mask == active_set)
             # or if torch.all(active_set[rule_mask])?
@@ -437,7 +437,7 @@ def main():
 
     on_delta = False
     if on_delta:
-        print("Not running in a Jupyter Notebook")
+        print("ON DELTA")
         hf_cache = "/u/dcheung2/content/hf_cache"
 
     os.environ["HF_HOME"] = hf_cache
@@ -455,21 +455,28 @@ def main():
     model_id = "gemma-2-2b"
     expl_layer = f"{sae_layer_idx}-gemmascope-res-16k"
 
-    task = "sva"
+    task = "key"
     if task == "sva":
-        topk_rules = 2
-        acts_train_path = 'all_activations_training_6000_sva.pt'
-        acts_test_path = 'all_activations_testing_6000_sva.pt'
+        batch_size = 16
+        max_samples_train = 6000
+        max_samples_test = 1000
+        acts_train_path = f'train_acts_sva_resid_{sae_layer_idx}_max_samples_{max_samples_train}.pt'
+        acts_test_path = f'test_acts_sva_resid_{sae_layer_idx}_max_samples_{max_samples_test}.pt'
         file_path = "data/sva/rc_train.json"
         example_length = 7
         groups_plaintext = {
             0:     [' go',  ' are', ' do',  ' have'], # plural
             1:     [' goes', ' is', ' does', ' has'], # singular
         }
+        topk_rules = 2
     elif task == "key":
-        topk_rules = 1
-        acts_train_path = f'all_activations_sae_{sae_layer_idx}_training_6000_key_number_no_traceback.pt'
-        acts_test_path = f'all_activations_sae_{sae_layer_idx}_testing_6000_key_number_no_traceback.pt'
+        batch_size = 16
+        max_samples_train = 6000
+        max_samples_test = 1000
+        acts_train_path = f'train_acts_key_no_err_resid_{sae_layer_idx}_max_samples_{max_samples_train}.pt'
+        acts_test_path = f'test_acts_key_no_err_resid_{sae_layer_idx}_max_samples_{max_samples_test}.pt'
+        acts_train_path = f'all_training_activations_sva_resid_{sae_layer_idx}_max_samples_{max_samples_train}.pt'
+        acts_train_path = f'all_training_activations_sva_resid_{sae_layer_idx}_max_samples_{max_samples_test}.pt'
         file_path = "data/codereason/key/data_len5_digit1.json"
         example_length = 41
         groups_plaintext = {
@@ -483,6 +490,7 @@ def main():
             7:     [ '8' ],
             8:     [ '9' ]
         }
+        topk_rules = 1
 
     # %%
     if not (os.path.exists(acts_train_path) and os.path.exists(acts_test_path)):
@@ -499,9 +507,8 @@ def main():
 
     clean_prompts, corr_prompts, clean_labels, corr_labels = process_data(tokenizer, data, example_length)
 
-    max_samples = 6000
-    clean_label_tokens = tokenizer(clean_labels[:max_samples], return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze(-1)
-    corr_label_tokens = tokenizer(corr_labels[:max_samples], return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze(-1)
+    clean_label_tokens = tokenizer(clean_labels[:max_samples_train], return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze(-1)
+    corr_label_tokens = tokenizer(corr_labels[:max_samples_train], return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze(-1)
 
     include_corr_tokens = True
     if include_corr_tokens:
@@ -519,23 +526,22 @@ def main():
     classes = list(groups.keys())
     # %%
     # sae_names = [sae.cfg.hook_name for sae in saes]
-    sae_names = ['blocks.23.hook_resid_post']
+    sae_names = [f'blocks.{sae_layer_idx}.hook_resid_post']
     if os.path.exists(acts_train_path):
         all_acts_train = torch.load(acts_train_path)
     else:
         clean_prompt_tokens, corr_prompt_tokens, clean_label_tokens, corr_label_tokens = tokenize_and_reshape(
             model, 
             clean_prompts, corr_prompts, clean_labels, corr_labels, 
-            batch_size=16, max_samples=max_samples
+            batch_size=batch_size, max_samples=max_samples_train
         )
         if include_corr_tokens:
             prompt_dataset = torch.cat((clean_prompt_tokens, corr_prompt_tokens), dim=0)
         else:
             prompt_dataset = clean_prompt_tokens
-        accuracy = evaluate_on_task(model, saes, clean_prompt_tokens[:10], clean_label_tokens[:10])
-        print(f"Accuracy: {accuracy*100:.2f}%")
         all_acts_train = get_all_activations(model, saes, sae_names, prompt_dataset)
         torch.save(all_acts_train, acts_train_path)
+        print("training activations saved to ", acts_train_path)
 
     nbins = 10               # Number of candidate bins for activation intervals
     min_samples = 10         # Minimal examples needed for a valid interval
@@ -640,8 +646,8 @@ def main():
     rules_by_class = make_rules(important_latent_idx_ranges, important_training_acts, k=topk_rules)
 
     # %%
-    sae_layer_for_rules = "blocks.23.hook_resid_post"
-    batch_size = 16
+    sae_layer_for_rules = f"blocks.{sae_layer_idx}.hook_resid_post"
+    batch_size = batch_size
     num_examples_test = batch_size * 63
     idx_test = slice(-num_examples_test, len(clean_labels), 1)
     test_prompts = clean_prompts[idx_test]
@@ -657,6 +663,7 @@ def main():
             tokens = model.to_tokens(batch_examples)
             all_acts_test[start_idx] = model_run_activations(model, saes, tokens)
         torch.save(all_acts_test, acts_test_path)
+        print("testing activations saved to ", acts_test_path)
 
     print(f"---- Testing on {num_examples_test} Examples (batch_size={batch_size}) ----")
 
