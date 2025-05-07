@@ -1,1 +1,1 @@
-Tasks and helpers borrowed from [ScalableSAECircuits](https://github.com/NainaniJatinZ/ScalableSAECircuits/tree/main).
+Tasks and helpers modified from [ScalableSAECircuits](https://github.com/NainaniJatinZ/ScalableSAECircuits/tree/main).
