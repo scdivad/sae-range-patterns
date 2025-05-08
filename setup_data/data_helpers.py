@@ -4,7 +4,7 @@ import torch
 
 def load_data(file_path: str):
     try:
-        if "rc_train" in file_path or "adex_train" in file_path or file_path.endswith(".jsonl"):
+        if "rc_train" in file_path or "ioi_train" in file_path or file_path.endswith(".jsonl"):
             with open(file_path, "r") as file:
                 data = [json.loads(line) for line in file]
         else:
@@ -20,6 +20,30 @@ def load_data(file_path: str):
         print(f"An error occurred: {e}")
     return None
 
+def process_data_formatted(tokenizer, data, example_length: int, balance_classes=False):
+    """
+    Filters and balances the dataset based on token length and class counts.
+    """
+    filtered = [
+        entry for entry in data
+        if len(tokenizer(entry['prompt']).input_ids) == example_length
+    ]
+    print(f"Number of filtered entries: {len(filtered)}")
+    if not balance_classes:
+        prompts = [entry['prompt'] for entry in filtered]
+        labels = [entry['label'] for entry in filtered]
+        return prompts, labels
+    label_counts = Counter(entry['label'] for entry in filtered)
+    max_per_label = min(label_counts.values())
+    prompts, labels = [], []
+    seen = defaultdict(int)
+    for entry in filtered:
+        label = entry['label']
+        if seen[label] < max_per_label:
+            prompts.append(entry['prompt'])
+            labels.append(label)
+            seen[label] += 1
+    return prompts, labels
 
 def process_data(tokenizer, data, example_length: int, balance_labels=False):
     """
@@ -63,10 +87,8 @@ def tokenize_and_reshape2(model, clean_data, clean_labels, batch_size: int = 16,
     """
     total_samples = (min(max_samples, len(clean_data)) // batch_size) * batch_size
     prompt_tokens = model.to_tokens(clean_data[:total_samples])
-    label_tokens = model.to_tokens(clean_labels[:total_samples], prepend_bos=False).squeeze(-1)
     prompt_tokens = prompt_tokens.reshape(-1, batch_size, prompt_tokens.shape[-1])
-    label_tokens = label_tokens.reshape(-1, batch_size)
-    return prompt_tokens, label_tokens
+    return prompt_tokens
 
 def tokenize_and_reshape(model, clean_data, corr_data, clean_labels, corr_labels, batch_size: int = 16, max_samples: int = int(1e9)):
     """

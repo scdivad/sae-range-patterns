@@ -647,8 +647,7 @@ def main():
 
     # %%
     sae_layer_for_rules = f"blocks.{sae_layer_idx}.hook_resid_post"
-    batch_size = batch_size
-    num_examples_test = batch_size * 63
+    num_examples_test = (max_samples_test // batch_size) * batch_size
     idx_test = slice(-num_examples_test, len(clean_labels), 1)
     test_prompts = clean_prompts[idx_test]
     test_labels = clean_labels[idx_test]
