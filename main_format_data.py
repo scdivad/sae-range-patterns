@@ -123,23 +123,6 @@ def scoring_all_ranges(
     nbins: int = 100,
     min_samples: int = 10,
 ):
-    """
-    Parameters
-    ----------
-    label_groups
-        • If None (default) behaviour is identical to the original function  
-        • If a *dict*  -> {group_name: [label1, label2, ...]}  
-        • If an *iterable of iterables*  -> [[label1, label2], [label3, …]]  
-          (groups will be named 'g0', 'g1', …)  
-        Any label not mentioned in `label_groups` is treated as its own singleton class.
-    """
-    # --------------------------------------------------------------------- #
-    # 1. Map raw labels → group names
-    # --------------------------------------------------------------------- #
-    
-    # --------------------------------------------------------------------- #
-    # 2. Usual preprocessing but with *group* labels
-    # --------------------------------------------------------------------- #
     classes_tokens = np.unique(labels)
     total_counts   = np.bincount(labels,
                                  minlength=classes_tokens.size).astype(np.float32)
@@ -147,9 +130,6 @@ def scoring_all_ranges(
     data      = []
     linspace  = np.linspace(neuron_vals.min(), neuron_vals.max(), nbins)
 
-    # --------------------------------------------------------------------- #
-    # 3. Sweep over (lb, ub) ranges as before
-    # --------------------------------------------------------------------- #
     for i, lb in enumerate(linspace):
         for ub in linspace[i + 1:]:
             in_range = (neuron_vals >= lb) & (neuron_vals <= ub)
@@ -179,131 +159,111 @@ def scoring_all_ranges(
             if entry.kl > 0.1 and entry.p_y_max > 0.1 and entry.p_range_max > 0.1:
                 data.append(entry)
     return data
-# # %%
-
+# %%
 def scoring_all_ranges_fast(
     latent_idx: int,
     sae_name: str,
-    neuron_vals: np.ndarray,
-    labels: Sequence[str],
+    x: np.ndarray, # neuron vals, TODO: rename to v
+    y: np.ndarray, # labels
     criteria=None,
     nbins: int = 10,
     min_samples: int = 10,
-    label_groups: Union[Mapping[str, Iterable[str]],
-                        Iterable[Iterable[str]], None] = None,
 ):
     """
-    Vectorised implementation (PyTorch) —
-    all O(nbins²) (lb, ub) combinations are scored in parallel.
+    latent_idx: j
+    x: (N,) v^{(i)}_j particular SAE latent value for all seen examples
+    y: (N,) y^{(i)} of all seen examples
 
-    The public doc‑string is unchanged; see original for details.
+    I will omit j in v_j since we only for the remainder of comments in this function
     """
+    N = x.shape[0]
+    classes = np.unique(y)
+    n_cls = classes.size
+    total_counts = np.bincount(y, minlength=n_cls)
 
-    # ------------------------------------------------------------------ #
-    # 1. Map raw labels → group names  (unchanged, still NumPy/pythonic) #
-    # ------------------------------------------------------------------ #
-    if label_groups is None:
-        grouped_labels = np.asarray(labels)
-    else:
-        if isinstance(label_groups, Mapping):
-            groups_dict = {lab: gname for gname, labs in label_groups.items()
-                                      for lab in labs}
-        else:
-            groups_dict = {lab: f"g{i}" for i, labs in enumerate(label_groups)
-                                         for lab in labs}
-        grouped_labels = np.array([groups_dict.get(lab, lab) for lab in labels])
+    sort_idx = np.argsort(x)
+    x = x[sort_idx]
+    y = y[sort_idx]
 
-    # ------------------------------------------------------------------ #
-    # 2. Encode classes to integer IDs (→ torch)                         #
-    # ------------------------------------------------------------------ #
-    classes_tokens, inv = np.unique(grouped_labels, return_inverse=True)
-    y      = torch.from_numpy(inv).long()         # (N,)
-    x      = (neuron_vals).float()
+    # Populates psum of shape (n_class, N + 1) where
+    # psum[c][i] gives the count of class c from position 0 to i-1 of y
+    psum = np.zeros((n_cls, N + 1), dtype=int)
 
-    n_cls  = classes_tokens.size
-    N      = x.size(0)
+    # This np.add.at operation is the same as:
+    # for i in range(N):
+    #   position = i + 1
+    #   psum[y[i], position] += 1
+    np.add.at(psum, (y, np.arange(N) + 1), 1)
 
-    # total counts per class for p_range
-    total_counts = torch.bincount(y, minlength=n_cls).float()   # (C,)
+    psum = np.cumsum(psum, axis=1)
 
-    # ------------------------------------------------------------------ #
-    # 3. Sort once → prefix‑sums                                         #
-    # ------------------------------------------------------------------ #
-    sort_idx      = torch.argsort(x)
-    x_sorted      = x[sort_idx]                    # (N,)
-    y_sorted      = y[sort_idx]                    # (N,)
+    # This triu_indices operation is the same as
+    # lb_ids, ub_ids = [], []
+    # for i in range(nbins):
+    #   for j in range(i+1, nbins):
+    #       lb_ids.append(i); ub_ids.append(j)
+    # lb_ids = np.array(lb_ids); ub_ids = np.array(ub_ids)
+    lb_ids, ub_ids = np.triu_indices(nbins, k=1)
 
-    # one‑hot → cumulative counts  (shape: C × (N+1))
-    cum = torch.zeros(n_cls, N + 1, dtype=torch.int32)
-    cum[ y_sorted, torch.arange(N) + 1 ] = 1       # scatter one‑hot
-    cum = cum.cumsum(dim=1)                        # prefix sums along samples
+    # Assume v is sorted (it is)
+    # For all lb in linspace, ub in linspace, we want the count of lb<=v<=ub and label=c over all N samples.
+    # That is the same as the number of positions between l,r inclusive, 0<=l,r<N, where
+    # r is the last idx of v over N samples such that v[idx] <= ub.
+    # l is the first idx of v over N samples such that lb <= v[idx].
+    # Had psum[c][i] given us the count from position 0 to i inclusive then the count would be
+    # psum[c][r] - psum[c][l-1], with psum[c][-1]:=0. 
+    # Since we are one off to remove edge case handling, it should be psum[c][r+1] - psum[c][l].
+    # So, let ub_pos=r+1, the first idx of v that satisfies ub < v[idx], i.e. v[idx-1] <= ub < v[idx]
+    # and lb_pos=l, the first idx of v that satisfies lb <= v[idx], i.e. v[idx-1] < lb <= v[idx]
+    # https://numpy.org/doc/2.2/reference/generated/numpy.searchsorted.html
+    linspace = np.linspace(x.min(), x.max(), nbins)
+    lb_pos = np.searchsorted(x, linspace, side='left') 
+    ub_pos = np.searchsorted(x, linspace, side='right')
+    # instead of grid search, better to make intervals
+    # that model the distribution of x
+    counts_in_lb = psum[:, lb_pos[lb_ids]]
+    counts_in_ub = psum[:, ub_pos[ub_ids]]
+    counts = (counts_in_ub - counts_in_lb).astype(float)
+    n_in_range = counts.sum(axis=0)
 
-    # ------------------------------------------------------------------ #
-    # 4. Discretise the value range & pre‑compute sample indices          #
-    # ------------------------------------------------------------------ #
-    edges          = torch.linspace(x.min(), x.max(), nbins)
-    lower_pos      = torch.searchsorted(x_sorted, edges, right=False)  # idx of first ≥ edge
-    upper_pos      = torch.searchsorted(x_sorted, edges, right=True)   # idx of first  > edge
-
-    # create all (i < j) combinations with torch.triu_indices
-    tri            = torch.triu_indices(nbins, nbins, offset=1)
-    lb_ids, ub_ids = tri[0], tri[1]               # (K,) each, K = nbins*(nbins-1)/2
-
-    # prefix‑sum slice:  counts_in_range = cum[:, ub_pos] - cum[:, lb_pos]
-    counts_in_lb   = cum[:, lower_pos[lb_ids]]    # (C, K)
-    counts_in_ub   = cum[:, upper_pos[ub_ids]]    # (C, K)
-    counts         = (counts_in_ub - counts_in_lb).float()      # (C, K)
-
-    # total samples per range
-    n_in_range     = counts.sum(dim=0)            # (K,)
-
-    # ------------------------------------------------------------------ #
-    # 5. Probabilities & information metrics (all vectorised)            #
-    # ------------------------------------------------------------------ #
-    valid_mask     = n_in_range >= min_samples
-    if not valid_mask.any():
-        return []                                 # nothing passes min_samples
-
-    counts         = counts[:, valid_mask]        # keep only candidate ranges
-    n_in_range     = n_in_range[valid_mask]       # (K',)
-    lb_ids         = lb_ids[valid_mask]
-    ub_ids         = ub_ids[valid_mask]
-
-    p_y            = counts / n_in_range          # (C, K')
-    with torch.no_grad():                         # avoid log(0) warnings
-        log_term   = torch.where(p_y > 0,
-                                 torch.log(p_y * n_cls),
-                                 torch.zeros_like(p_y))
-    kl             = (p_y * log_term).sum(dim=0)  # (K',)
-
-    p_range        = counts / total_counts.unsqueeze(1)          # (C, K')
-    p_y_max        = p_y.max(dim=0).values
-    p_range_max    = p_range.max(dim=0).values
-
-    select_mask    = (kl > 0.1) & (p_y_max > 0.1) & (p_range_max > 0.1)
-
-    if not select_mask.any():
+    valid_mask = n_in_range >= min_samples
+    if not np.any(valid_mask):
         return []
 
-    # ------------------------------------------------------------------ #
-    # 6. Materialise the short‑listed ranges as LatentRangeEntry objects #
-    # ------------------------------------------------------------------ #
-    sel_idx        = torch.nonzero(select_mask, as_tuple=False).squeeze(1)
-    pred_cls_idx   = p_y[:, sel_idx].argmax(dim=0)
+    counts = counts[:, valid_mask]
+    n_in_range = n_in_range[valid_mask]
+    lb_ids = lb_ids[valid_mask]
+    ub_ids = ub_ids[valid_mask]
+
+    p_y = counts / n_in_range
+    log_term = np.where(p_y > 0, np.log(p_y * n_cls), np.zeros_like(p_y))
+    kl = (p_y * log_term).sum(axis=0)
+
+    p_range = counts / total_counts[:, np.newaxis]
+    p_y_max = np.max(p_y, axis=0)
+    p_range_max = np.max(p_range, axis=0)
+
+    select_mask = (kl > 0.1) & (p_y_max > 0.1) & (p_range_max > 0.1)
+
+    if not np.any(select_mask):
+        return []
+
+    sel_idx = np.nonzero(select_mask)[0]
+    pred_cls_idx = np.argmax(p_y[:, sel_idx], axis=0)
 
     data = []
-    for k, idx in enumerate(sel_idx.tolist()):
+    for k, idx in enumerate(sel_idx):
         entry = LatentRangeEntry(
             latent_idx=latent_idx,
             sae_name=sae_name,
-            lb=edges[ lb_ids[idx] ].item(),
-            ub=edges[ ub_ids[idx] ].item(),
-            kl=kl[idx].item(),
-            p_y=p_y[:, idx].cpu().numpy().copy(),
-            p_range=p_range[:, idx].cpu().numpy().copy(),
-            p_y_max=p_y_max[idx].item(),
-            p_range_max=p_range_max[idx].item(),
-            pred_class=classes_tokens[ pred_cls_idx[k] ],
+            lb=linspace[lb_ids[idx]],
+            ub=linspace[ub_ids[idx]],
+            kl=kl[idx],
+            p_y=p_y[:, idx].copy(),
+            p_range=p_range[:, idx].copy(),
+            p_y_max=p_y_max[idx],
+            p_range_max=p_range_max[idx],
+            pred_class=classes[pred_cls_idx[k]],
         )
         data.append(entry)
 
@@ -356,7 +316,7 @@ def get_prediction(
     activation: torch.Tensor,
     rules_by_class: dict[str, torch.Tensor],
     sae_layer_for_rules: str,
-    important_latent_idx_ranges: dict[str, dict[str, list[tuple]]],
+    important_latent_idx_ranges: dict[str, dict[int, list[tuple]]],
 ) -> list:
     """
     Predict classes whose any of the top-k rules match the given activation.
@@ -445,7 +405,7 @@ def main():
     model_id = "gemma-2-2b"
     expl_layer = f"{sae_layer_idx}-gemmascope-res-16k"
 
-    task = "ioi"
+    task = "key"
     if task == "sva":
         batch_size = 16
         max_samples_train = 6000
@@ -467,24 +427,13 @@ def main():
     elif task == "key":
         batch_size = 16
         max_samples_train = 6000
-        max_samples_test = 1000
+        max_samples_test = 992
         acts_train_path = f'train_acts_key_no_err_resid_{sae_layer_idx}_max_samples_{max_samples_train}.pt'
         acts_test_path = f'test_acts_key_no_err_resid_{sae_layer_idx}_max_samples_{max_samples_test}.pt'
-        acts_train_path = f'all_training_activations_sva_resid_{sae_layer_idx}_max_samples_{max_samples_train}.pt'
-        acts_train_path = f'all_training_activations_sva_resid_{sae_layer_idx}_max_samples_{max_samples_test}.pt'
-        file_path = "data/codereason/key/data_len5_digit1.json"
+        acts_train_path = f'all_training_activations_key_no_err_resid_{sae_layer_idx}_max_samples_{max_samples_train}.pt'
+        acts_train_path = f'all_training_activations_key_no_err_resid_{sae_layer_idx}_max_samples_{max_samples_test}.pt'
+        file_path = "format_sfc/formatted_key_no_traceback.json"
         example_length = 41
-        groups_plaintext = {
-            0:     [ '1' ],
-            1:     [ '2' ],
-            2:     [ '3' ],
-            3:     [ '4' ],
-            4:     [ '5' ],
-            5:     [ '6' ],
-            6:     [ '7' ],
-            7:     [ '8' ],
-            8:     [ '9' ]
-        }
         topk_rules = 1
 
     # %%
@@ -503,7 +452,6 @@ def main():
     clean_prompts, clean_labels = process_data_formatted(tokenizer, data, example_length)
     label_dataset = clean_labels[:max_samples_train]
     
-    classes = [0,1] # TODO: fix
     # %%
     # sae_names = [sae.cfg.hook_name for sae in saes]
     sae_names = [f'blocks.{sae_layer_idx}.hook_resid_post']
@@ -528,50 +476,63 @@ def main():
 
     # %%
     entries = []
-
     for sae_name in sae_names:
-        # pull your dense tensor into CPU-memory and (optionally) numpy for pickling
-        dense_acts = all_acts_train[sae_name].to_dense().cpu().numpy()
-        active_mask = (dense_acts > 0).any(axis=0)
-        active_indices = list(active_mask.nonzero()[0])
+        dense_acts = all_acts_train[sae_name].to_dense()
+        active_mask = (dense_acts > 0).any(dim=0)
+        active_indices = torch.nonzero(active_mask).flatten()
         print(f"Layer {sae_name}: {len(active_indices)} out of {dense_acts.shape[1]} neurons are active (> 0) at least once.")
-
-        # define the per-neuron work
-        def _score_neuron(i):
-            # grab the i-th column back into a torch Tensor if your scorer expects one
-            neuron_vals = torch.from_numpy(dense_acts[:, i])
-            return scoring_all_ranges(
+        for i in tqdm(active_indices.tolist(), desc=f"Processing {sae_name} neurons"):
+            neuron_vals = dense_acts[:, i]
+            entries += scoring_all_ranges_fast(
                 i,
                 sae_name,
                 neuron_vals,
                 label_dataset_flat_np,
-                criteria=lambda entry:  entry.p_y_max > 0.1
-                                        and entry.p_range_max > 0.1,
-                nbins=nbins,
+                criteria=lambda entry: entry.kl > 0.1 and entry.p_y_max > 0.1 and entry.p_range_max > 0.1,
+                nbins=nbins, 
                 min_samples=min_samples,
             )
-
-        # process in parallel, showing a tqdm bar
-        # max_workers defaults to os.cpu_count(), but you can override if desired
-        results = process_map(
-            _score_neuron,
-            active_indices,
-            desc=f"Processing {sae_name} neurons",
-            max_workers=None,   # or set to e.g. 8
-            chunksize=1
-        )
-
-        # flatten and extend your entries list
-        entries.extend(itertools.chain.from_iterable(results))
-
+        
         del dense_acts
-
-
+    
     print(len(entries))
+    # %%
+    # entries = []
+    # for sae_name in sae_names:
+    #     dense_acts = all_acts_train[sae_name].to_dense().cpu().numpy()
+    #     active_mask = (dense_acts > 0).any(axis=0)
+    #     active_indices = list(active_mask.nonzero()[0])
+    #     print(f"Layer {sae_name}: {len(active_indices)} out of {dense_acts.shape[1]} neurons are active (> 0) at least once.")
+
+    #     def _score_neuron(i):
+    #         neuron_vals = torch.from_numpy(dense_acts[:, i])
+    #         return scoring_all_ranges(
+    #             i,
+    #             sae_name,
+    #             neuron_vals,
+    #             label_dataset_flat_np,
+    #             criteria=lambda entry:  entry.p_y_max > 0.1
+    #                                     and entry.p_range_max > 0.1,
+    #             nbins=nbins,
+    #             min_samples=min_samples,
+    #         )
+
+    #     results = process_map(
+    #         _score_neuron,
+    #         active_indices,
+    #         desc=f"Processing {sae_name} neurons",
+    #         max_workers=None,
+    #         chunksize=1
+    #     )
+
+    #     entries.extend(itertools.chain.from_iterable(results))
+    #     del dense_acts
+
+    # print(len(entries))
     # %%
     # latent activation statistics
     i = 0
-    num_plot = 30
+    num_plot = 10
     entries.sort(key=lambda x: -x.p_range_max)
     for entry in entries:
         class_tokenized = entry.pred_class
@@ -609,7 +570,7 @@ def main():
     important_latent_idx_ranges = build_important_latents(
         entries,
         sae_names,
-        classes,
+        classes=[i for i in range(len(np.unique(clean_labels)))],
         score=lambda entry: (math.log(entry.p_y_max) + math.log(entry.p_range_max), -(entry.ub - entry.lb))
     )
     # %%
@@ -620,8 +581,7 @@ def main():
         torch.from_numpy(label_dataset_flat_np),
     )
 
-    rules_by_class = make_rules(important_latent_idx_ranges, important_training_acts, k=10)
-    # rules_by_class = make_rules(important_latent_idx_ranges, important_training_acts, k=topk_rules)
+    rules_by_class = make_rules(important_latent_idx_ranges, important_training_acts, k=topk_rules)
 
     # %%
     sae_layer_for_rules = f"blocks.{sae_layer_idx}.hook_resid_post"
@@ -642,6 +602,7 @@ def main():
         torch.save(all_acts_test, acts_test_path)
         print("testing activations saved to ", acts_test_path)
 
+    # %%
     print(f"---- Testing on {num_examples_test} Examples (batch_size={batch_size}) ----")
 
     predictions = []
@@ -654,8 +615,12 @@ def main():
                 sae_layer_for_rules, 
                 important_latent_idx_ranges,
             ))
-    for p, gt in zip(predictions, test_labels):
-        print(p, gt)
+            if len(predictions[-1]):
+                predictions[-1][0] += 1
+                predictions[-1][0] = str(predictions[-1][0])
+            
+    # for p, gt in zip(predictions, test_labels):
+    #     print(len(p), p[0]==gt, type(p[0]), type(gt), len(p) == 1 and p[0] == gt)
     precision = sum(
         1 for p, gt in zip(predictions, test_labels)
         if len(p) == 1 and p[0] == gt
@@ -667,7 +632,7 @@ def main():
     print(f"Test Abstain: {abstain*100:.2f}%")
     # %%
     rules_as_sets = apply_rule_mask_to_sets_with_ranges(rules_by_class, important_latent_idx_ranges)
-    for layer, class_dict in rules_as_sets.items():
+    for layer, class_dict in rules_as_sets.items(): 
         print(f"\n=== Layer: {layer} ===")
         for cls, rules in class_dict.items():
             print(f"\nClass: {cls}")

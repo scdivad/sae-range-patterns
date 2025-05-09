@@ -4,7 +4,7 @@ import torch
 
 def load_data(file_path: str):
     try:
-        if "rc_train" in file_path or "ioi_train" in file_path or file_path.endswith(".jsonl"):
+        if "rc_train" in file_path or "key" in file_path or "ioi_train" in file_path or file_path.endswith(".jsonl"):
             with open(file_path, "r") as file:
                 data = [json.loads(line) for line in file]
         else:
